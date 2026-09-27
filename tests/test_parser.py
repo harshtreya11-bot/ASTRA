@@ -72,5 +72,25 @@ class TestParser(unittest.TestCase):
         self.assertEqual(norm["raw_request"], 'GET /search?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E HTTP/1.1')
 
 
+    def test_stream_parser(self):
+        import io
+        from core.parser import parse_log_stream
+        lines = [
+            '192.168.1.20 - - [25/Sep/2026:10:32:15 +0530] "GET /about HTTP/1.1" 200 1024 "-" "Mozilla/5.0"\n',
+            '192.168.1.21 - - [25/Sep/2026:10:32:16 +0530] "GET /login HTTP/1.1" 200 512 "-" "Mozilla/5.0"\n',
+            '192.168.1.22 - - [25/Sep/2026:10:32:17 +0530] "POST /api HTTP/1.1" 201 256 "-" "Mozilla/5.0"\n',
+        ]
+        stream = io.StringIO("".join(lines))
+        chunks = list(parse_log_stream(stream, chunk_size=2))
+        self.assertEqual(len(chunks), 2)
+        chunk1_events, chunk1_count, err1 = chunks[0]
+        self.assertIsNone(err1)
+        self.assertEqual(len(chunk1_events), 2)
+        chunk2_events, chunk2_count, err2 = chunks[1]
+        self.assertIsNone(err2)
+        self.assertEqual(len(chunk2_events), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
+

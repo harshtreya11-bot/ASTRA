@@ -19,8 +19,9 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
+import io
 import config
-from core.parser import parse_log_content
+from core.parser import parse_log_content, parse_log_stream
 from core.normalizer import normalize_events
 from core.detector import detect_attacks
 from core.correlator import correlate_alerts
@@ -255,50 +256,107 @@ def _init_state():
             st.session_state[k] = v
 
 
-def _load_and_analyze(log_text: str, source_label: str = "upload"):
-    """Full pipeline: parse → normalize → detect → correlate → store."""
+def _load_and_analyze(source, source_label: str = "upload"):
+    """
+    Memory-efficient streaming pipeline for large (up to 4GB+) log files:
+    parse stream chunk → normalize → detect → save to DB → correlate → render summary.
+    """
     db = get_db()
+    db.clear_all()
 
-    with st.spinner("📝 Parsing log data…"):
-        events, err = parse_log_content(log_text)
-        if err:
-            st.error(f"Parse error: {err}")
-            return False
-        if not events:
-            st.warning("No events parsed from the provided data.")
-            return False
+    total_parsed_events = 0
+    all_alerts = []
+    sample_events = []
 
-    with st.spinner("🔧 Normalizing requests…"):
-        events = normalize_events(events)
+    file_to_close = None
+    if isinstance(source, str) and os.path.exists(source):
+        stream = open(source, "rb")
+        file_to_close = stream
+        filename = source
+    elif isinstance(source, str):
+        stream = io.StringIO(source)
+        filename = source_label
+    else:
+        stream = source
+        filename = getattr(source, "name", source_label)
 
-    with st.spinner("🔍 Running detection engine…"):
-        alerts = detect_attacks(
-            events,
-            enabled_rule_ids=st.session_state.get("enabled_rules"),
-            brute_threshold=st.session_state.get("brute_threshold"),
-            brute_window=st.session_state.get("brute_window"),
-        )
+    status_text = st.empty()
+    progress_bar = st.progress(0)
+    status_text.text("🚀 Initializing log analysis engine...")
 
-    with st.spinner("🔗 Correlating events…"):
-        campaigns = correlate_alerts(
-            alerts,
-            window_minutes=st.session_state.get("corr_window"),
-        )
+    batch_count = 0
+    chunk_size = 50000
 
-    with st.spinner("💾 Saving to database…"):
-        db.clear_all()
-        db.insert_events(events)
-        db.insert_alerts(alerts)
+    try:
+        for events_chunk, lines_processed, err in parse_log_stream(stream, filename=filename, chunk_size=chunk_size):
+            if err:
+                st.error(f"Parse error: {err}")
+                return False
+
+            if not events_chunk:
+                continue
+
+            batch_count += 1
+            status_text.text(
+                f"⏳ Processing batch #{batch_count} | {lines_processed:,} lines parsed | "
+                f"{len(all_alerts):,} alerts detected so far..."
+            )
+
+            # 1. Normalize
+            events_chunk = normalize_events(events_chunk)
+
+            # 2. Detect attacks
+            chunk_alerts = detect_attacks(
+                events_chunk,
+                enabled_rule_ids=st.session_state.get("enabled_rules"),
+                brute_threshold=st.session_state.get("brute_threshold"),
+                brute_window=st.session_state.get("brute_window"),
+            )
+            all_alerts.extend(chunk_alerts)
+
+            # 3. Store batch in SQLite
+            db.insert_events(events_chunk)
+            if chunk_alerts:
+                db.insert_alerts(chunk_alerts)
+
+            total_parsed_events += len(events_chunk)
+
+            # Keep a sample of up to 10,000 events for fast UI preview
+            if len(sample_events) < 10000:
+                needed = 10000 - len(sample_events)
+                sample_events.extend(events_chunk[:needed])
+
+    finally:
+        if file_to_close:
+            file_to_close.close()
+
+    if total_parsed_events == 0:
+        status_text.empty()
+        progress_bar.empty()
+        st.warning("No valid log events parsed from the provided data.")
+        return False
+
+    status_text.text("🔗 Correlating attack campaigns across alerts...")
+    campaigns = correlate_alerts(
+        all_alerts,
+        window_minutes=st.session_state.get("corr_window"),
+    )
+
+    if campaigns:
         db.insert_campaigns(campaigns)
 
-    st.session_state["events"] = events
-    st.session_state["alerts"] = alerts
+    st.session_state["events"] = sample_events
+    st.session_state["total_events_count"] = total_parsed_events
+    st.session_state["alerts"] = all_alerts
     st.session_state["campaigns"] = campaigns
     st.session_state["data_loaded"] = True
 
+    status_text.empty()
+    progress_bar.empty()
+
     st.success(
-        f"✅ Analysis complete | {len(events)} events | "
-        f"{len(alerts)} alerts | {len(campaigns)} campaigns"
+        f"✅ Analysis complete! Processed {total_parsed_events:,} events | "
+        f"{len(all_alerts):,} alerts | {len(campaigns):,} campaigns"
     )
     return True
 
@@ -383,21 +441,35 @@ def _sidebar():
             if st.button("🗑️ Clear", use_container_width=True):
                 get_db().clear_all()
                 st.session_state["events"] = []
+                st.session_state["total_events_count"] = 0
                 st.session_state["alerts"] = []
                 st.session_state["campaigns"] = []
                 st.session_state["data_loaded"] = False
                 st.rerun()
 
         uploaded = st.file_uploader(
-            "Upload Log/CSV",
+            "Upload Log/CSV (Up to 5GB)",
             type=["log", "txt", "csv"],
             label_visibility="collapsed",
         )
         if uploaded:
-            content = uploaded.read().decode("utf-8", errors="replace")
-            if _load_and_analyze(content, uploaded.name):
+            if _load_and_analyze(uploaded, uploaded.name):
                 st.session_state.page = "Dashboard"
                 st.rerun()
+
+        with st.expander("📁 Analyze Local Disk File (4GB+)"):
+            local_path = st.text_input(
+                "Local file path",
+                placeholder="/path/to/access.log",
+                key="sidebar_local_path"
+            )
+            if st.button("⚡ Analyze Local File", use_container_width=True):
+                if local_path and os.path.exists(local_path):
+                    if _load_and_analyze(local_path, local_path):
+                        st.session_state.page = "Dashboard"
+                        st.rerun()
+                else:
+                    st.error("File not found at specified path.")
 
         st.divider()
 
@@ -405,10 +477,11 @@ def _sidebar():
         if st.session_state.data_loaded:
             alerts = st.session_state["alerts"]
             rc = Counter(a.get("risk_level") for a in alerts)
+            total_ev = st.session_state.get("total_events_count", len(st.session_state['events']))
             st.markdown(f"""
             <div style="font-size:0.75rem; color:#8b949e;">
-            📌 <b style="color:#e6edf3;">{len(st.session_state['events'])}</b> events&nbsp;&nbsp;
-            🚨 <b style="color:#e6edf3;">{len(alerts)}</b> alerts<br>
+            📌 <b style="color:#e6edf3;">{total_ev:,}</b> events&nbsp;&nbsp;
+            🚨 <b style="color:#e6edf3;">{len(alerts):,}</b> alerts<br>
             🔴 {rc.get('CRITICAL',0)} critical &nbsp;
             🟠 {rc.get('HIGH',0)} high<br>
             🟡 {rc.get('MEDIUM',0)} medium &nbsp;
@@ -447,9 +520,10 @@ def page_dashboard():
     suspicious_ips = {a["source_ip"] for a in alerts}
 
     # ---- Metric cards ----
+    total_events = st.session_state.get("total_events_count", len(events))
     cols = st.columns(6)
     metrics = [
-        ("Total Requests", len(events), ""),
+        ("Total Requests", f"{total_events:,}", ""),
         ("Suspicious Requests", len({a["event_id"] for a in alerts if a.get("event_id")}), ""),
         ("Critical Alerts", risk_counts.get("CRITICAL", 0), "metric-critical"),
         ("High Alerts", risk_counts.get("HIGH", 0), "metric-high"),
@@ -1016,7 +1090,8 @@ def page_log_analysis():
     events = st.session_state["events"]
     df = _events_to_df(events)
 
-    st.markdown(f"**{len(events)} events loaded**")
+    total_ev = st.session_state.get("total_events_count", len(events))
+    st.markdown(f"**{total_ev:,} total events processed** (showing sample preview)")
 
     # Search
     search = st.text_input("🔍 Search events (IP, endpoint, user agent…)", key="ev_search")

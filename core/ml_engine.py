@@ -61,8 +61,9 @@ def detect_anomalies_ml(events: List[Dict]) -> List[Dict]:
         return alerts
         
     try:
-        # Extract features for all events
-        X = np.array([extract_features(ev) for ev in events])
+        # Cap max events for ML training to 10,000 to keep memory low on 4GB+ log files
+        target_events = events[:10000] if len(events) > 10000 else events
+        X = np.array([extract_features(ev) for ev in target_events])
         
         # Train Isolation Forest
         # contamination sets the expected proportion of outliers (anomalies)
